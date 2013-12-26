@@ -10,13 +10,16 @@ CREATE TABLE version -- added in v1
 
 CREATE TABLE `nodes`
 (
+ `isdir` INTEGER, -- 0 or 1
  `id` INTEGER PRIMARY KEY AUTOINCREMENT,
  `parentid` INTEGER, -- or NULL for a root
- `isdir` INTEGER, -- 0 or 1
+ `name` VARCHAR,
  `size` INTEGER, -- bytes: length of file, or serialized directory
  `cumulative_size` INTEGER, -- sum of 'size' from this node and all children
  `filecap` VARCHAR
 );
+
+CREATE INDEX `parentid` ON `nodes` (`parentid`);
 
 """
 
@@ -30,11 +33,13 @@ class Scanner:
     def process_directory(self, localpath, parentid):
         # localpath is relative to self.rootpath
         abspath = os.path.join(self.rootpath, localpath)
-        print "DIR", abspath
+        print "%sDIR: %s" % (" "*(len(localpath.split(os.sep))-1), localpath)
         s = os.stat(abspath)
         size = s.st_size # good enough for now
-        dirid = self.db.execute("INSERT INTO nodes (parentid, isdir, size)"
-                                " VALUES (?,1,?)", (parentid, size)
+        name = os.path.basename(os.path.abspath(abspath))
+        dirid = self.db.execute("INSERT INTO nodes"
+                                " (parentid, name, isdir, size)"
+                                " VALUES (?,?,?,?)", (parentid, name, 1, size)
                                 ).lastrowid
         cumulative_size = size
         for child in os.listdir(abspath):
@@ -54,11 +59,14 @@ class Scanner:
 
     def process_file(self, localpath, parentid):
         abspath = os.path.join(self.rootpath, localpath)
-        print "FILE", abspath
+        name = os.path.basename(os.path.abspath(abspath))
+        print "%sFILE %s" % (" "*(len(localpath.split(os.sep))-1), name)
+
         s = os.stat(abspath)
         size = s.st_size
-        fileid = self.db.execute("INSERT INTO nodes (parentid, isdir, size)"
-                                 " VALUES (?,0,?)", (parentid, size)
+        fileid = self.db.execute("INSERT INTO nodes "
+                                 "(parentid, name, isdir, size)"
+                                 " VALUES (?,?,?,?)", (parentid, name, 0, size)
                                  ).lastrowid
         return fileid, size
 
