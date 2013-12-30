@@ -1,5 +1,6 @@
 
-import sys, os, hashlib, time
+import sys, os, time, json, base64
+from hashlib import sha256
 import dbutil
 from abbreviate import abbreviate_space
 
@@ -44,14 +45,22 @@ CREATE TABLE `filetable`
 (
  `snapshotid` INTEGER,
  `path` VARCHAR,
- `metadata_json` VARCHAR
+ `metadata_json` VARCHAR,
  `size` INTEGER,
  `mtime` INTEGER,
- `fileid` VARCHAR
+ `fileid` VARCHAR -- hash of file, or random until we want efficient renames
 );
 
 CREATE INDEX `snapshotid_path` ON `filetable` (`snapshotid`, `path`);
 CREATE INDEX `fileid` ON `filetable` (`fileid`);
+
+CREATE TABLE `need_to_upload`
+(
+ `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+ `path` VARCHAR,
+ `fileid` VARCHAR,
+ `size` INTEGER
+);
 
 CREATE TABLE `captable`
 (
@@ -121,6 +130,18 @@ class Scanner:
         s = os.stat(abspath)
         size = s.st_size # good enough for now
         name = os.path.basename(os.path.abspath(abspath))
+        metadata = {"st_mode": s.st_mode,
+                    "st_uid": s.st_uid,
+                    "st_gid": s.st_gid,
+                    "st_atime": s.st_atime,
+                    "st_mtime": s.st_mtime,
+                    "st_ctime": s.st_ctime,
+                    }
+        self.db.execute("INSERT INTO dirtable"
+                        " (snapshotid, path, metadata_json)"
+                        " VALUES (?,?,?)",
+                        (snapshotid, localpath, json.dumps(metadata))
+                        )
         dirid = self.db.execute("INSERT INTO nodes"
                                 " (snapshotid, parentid, name, isdir, size)"
                                 " VALUES (?,?,?,?,?)",
@@ -163,6 +184,29 @@ class Scanner:
 
         s = os.stat(abspath)
         size = s.st_size
+        metadata = {"st_mode": s.st_mode,
+                    "st_uid": s.st_uid,
+                    "st_gid": s.st_gid,
+                    "st_size": s.st_size,
+                    "st_atime": s.st_atime,
+                    "st_mtime": s.st_mtime,
+                    "st_ctime": s.st_ctime,
+                    }
+        # fileid will be the raw sha256 hash of the file contents. Hashing
+        # files will let us efficiently handle renames (not re-uploading an
+        # unmodified file that just happens to live in a different location
+        # than before) as well as duplicates. We'll only hash files when we
+        # don't recognize their path+mtime+size. For now, rather than pay the
+        # IO cost of hashing such files, we'll just make the fileid a
+        # deterministic random function of path+mtime+size.
+        fileid = sha256("%s:%s:%s" % (localpath.encode("utf-8"), s.st_mtime, s.st_size)).hexdigest()
+        self.db.execute("INSERT INTO filetable"
+                        " (snapshotid, path, metadata_json, size, mtime,fileid)"
+                        " VALUES (?,?,?,?,?,?)",
+                        (snapshotid, localpath, json.dumps(metadata),
+                         s.st_size, s.st_mtime, fileid)
+                        )
+
         fileid = self.db.execute("INSERT INTO nodes "
                                  "(snapshotid, parentid, name, isdir,"
                                  " size, cumulative_size, cumulative_items)"
@@ -177,7 +221,7 @@ class Scanner:
     def upload_file(self, abspath):
         return "fake filecap"
         f = open(abspath, "rb")
-        h = hashlib.sha256()
+        h = sha256()
         while True:
             data = f.read(32*1024)
             if not data:
