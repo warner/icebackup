@@ -1,9 +1,15 @@
 
-import sys, math, sqlite3, collections
+import os, sys, math, sqlite3, collections
 from abbreviate import abbreviate_space, abbreviate_time
 
 db = sqlite3.connect(sys.argv[1])
+db.row_factory = sqlite3.Row
 c = db.cursor()
+
+subpath = []
+if len(sys.argv) > 2:
+    subpath = sys.argv[2].split(os.sep)
+
 bucket_edges = [ (0,0), (1,3)]
 root = math.sqrt(10)
 
@@ -39,17 +45,48 @@ class Bucket:
     raw_size = 0
     padded_size = 0
 buckets = collections.defaultdict(Bucket)
-snapshotid = c.execute("SELECT id FROM snapshots WHERE finished IS NOT NULL"
-                       " ORDER BY finished ASC LIMIT 1").fetchone()[0]
-c.execute("SELECT size FROM filetable WHERE snapshotid=?",
-          (snapshotid,))
+
+# find the set of directories we're going to care about
+row = c.execute("SELECT * FROM snapshots WHERE finished IS NOT NULL"
+                " ORDER BY finished DESC LIMIT 1").fetchone()
+snapshotid = row["id"]
+root_id = row["root_id"]
+node = root_id
+
+def subtree(root_node):
+    to_explore = set([root_node])
+    found = set()
+    while to_explore:
+        n = to_explore.pop()
+        found.add(n)
+        c.execute("SELECT id FROM dirtable WHERE parentid=?", (n,))
+        for row in c.fetchall():
+            new_node = row["id"]
+            if new_node in found:
+                raise KeyError("Hey, no cycles")
+            to_explore.add(new_node)
+    return found
+
+if not subpath:
+    c.execute("SELECT id FROM dirtable WHERE snapshotid=?", (snapshotid,))
+    subnodes = set([row["id"] for row in c.fetchall()])
+else:
+    for name in subpath:
+        node = c.execute("SELECT id FROM dirtable WHERE parentid=? AND name=?",
+                         (node, name)).fetchone()[0]
+    print "finding subtree"
+    subnodes = subtree(node)
+    print "found %d subnodes" % len(subnodes)
+
+c.execute("SELECT * FROM filetable WHERE snapshotid=?", (snapshotid,))
 for row in c.fetchall():
-    size = row[0]
-    edges = which_bucket(size)
-    bucket = buckets[edges]
-    bucket.count += 1
-    bucket.raw_size += size
-    bucket.padded_size += size + 32768
+    if row["parentid"] in subnodes:
+        size = row["size"]
+        edges = which_bucket(size)
+        bucket = buckets[edges]
+        bucket.count += 1
+        bucket.raw_size += size
+        bucket.padded_size += size + 32768
 
 
 template = "{0:^23}: {1:>9} {2:>9}  {3:>9}  {4:>9}"
@@ -80,8 +117,7 @@ print template.format("total", total_count, abbreviate_space(total_raw_size),
                       abbreviate_space(total_padded),
                       abbreviate_space(total_pad))
 
-c.execute("SELECT COUNT(*) FROM dirtable WHERE snapshotid=?", (snapshotid,))
-print "%d directories" % (c.fetchone()[0])
+print "%d directories" % len(subnodes)
 
 def money(val):
     return "$%1.2f" % val
@@ -94,7 +130,8 @@ TRANSFER_COST = 0.12/1e9
 
 print "upload: req=%s, time=%s" % (money(REQ_COST*total_count),
                                    abbreviate_time(total_raw_size / UPLOAD_RATE))
-print "storage: %s/mo" % money(STORAGE_COST*total_padded)
+print "storage: %s/mo (%s/yr)" % (money(STORAGE_COST*total_padded),
+                                  money(12*STORAGE_COST*total_padded))
 down_req = REQ_COST*total_count
 down_time = total_raw_size / DOWNLOAD_RATE
 down_months = math.ceil(down_time / (30*24*3600))
