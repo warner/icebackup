@@ -41,7 +41,7 @@ class Bucket:
 buckets = collections.defaultdict(Bucket)
 snapshotid = c.execute("SELECT id FROM snapshots WHERE finished IS NOT NULL"
                        " ORDER BY finished ASC LIMIT 1").fetchone()[0]
-c.execute("SELECT size FROM nodes WHERE isdir=0 and snapshotid=?",
+c.execute("SELECT size FROM filetable WHERE snapshotid=?",
           (snapshotid,))
 for row in c.fetchall():
     size = row[0]
@@ -80,7 +80,7 @@ print template.format("total", total_count, abbreviate_space(total_raw_size),
                       abbreviate_space(total_padded),
                       abbreviate_space(total_pad))
 
-c.execute("SELECT COUNT(*) FROM nodes WHERE isdir=1")
+c.execute("SELECT COUNT(*) FROM dirtable WHERE snapshotid=?", (snapshotid,))
 print "%d directories" % (c.fetchone()[0])
 
 def money(val):

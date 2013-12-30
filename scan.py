@@ -19,40 +19,32 @@ CREATE TABLE `snapshots`
  `root_id` INTEGER
 );
 
-CREATE TABLE `nodes`
-(
- `snapshotid` INTEGER,
- `isdir` INTEGER, -- 0 or 1
- `id` INTEGER PRIMARY KEY AUTOINCREMENT,
- `parentid` INTEGER, -- or NULL for a root
- `name` VARCHAR,
- `size` INTEGER, -- bytes: length of file, or serialized directory
- `cumulative_size` INTEGER, -- sum of 'size' from this node and all children
- `cumulative_items` INTEGER,
- `filecap` VARCHAR
-);
-
-CREATE INDEX `parentid` ON `nodes` (`parentid`);
-
 CREATE TABLE `dirtable`
 (
+ `id` INTEGER PRIMARY KEY AUTOINCREMENT,
  `snapshotid` INTEGER,
- `path` VARCHAR,
- `metadata_json` VARCHAR
+ `parentid` INTEGER, -- or NULL for a root
+ `name` VARCHAR,
+ `metadata_json` VARCHAR,
+ `cumulative_size` INTEGER,
+ `cumulative_items` INTEGER
 );
+CREATE INDEX `dirtable_snapshotid_parentid_name` ON `dirtable`
+ (`snapshotid`, `parentid`, `name`);
 
 CREATE TABLE `filetable`
 (
  `snapshotid` INTEGER,
- `path` VARCHAR,
+ `parentid` INTEGER NOT NULL,
+ `name` VARCHAR,
  `metadata_json` VARCHAR,
  `size` INTEGER,
  `mtime` INTEGER,
  `fileid` VARCHAR -- hash of file, or random until we want efficient renames
 );
-
-CREATE INDEX `snapshotid_path` ON `filetable` (`snapshotid`, `path`);
-CREATE INDEX `fileid` ON `filetable` (`fileid`);
+CREATE INDEX `filetable_snapshotid_parentid_name` ON `filetable`
+ (`snapshotid`, `parentid`, `name`);
+CREATE INDEX `filetable_fileid` ON `filetable` (`fileid`);
 
 CREATE TABLE `need_to_upload`
 (
@@ -69,7 +61,7 @@ CREATE TABLE `captable`
  `filecap` VARCHAR
 );
 
-CREATE INDEX `filecap` ON `captable` (`filecap`);
+CREATE INDEX `captable_filecap` ON `captable` (`filecap`);
 
 CREATE TABLE `small_objmap`
 (
@@ -137,16 +129,12 @@ class Scanner:
                     "st_mtime": s.st_mtime,
                     "st_ctime": s.st_ctime,
                     }
-        self.db.execute("INSERT INTO dirtable"
-                        " (snapshotid, path, metadata_json)"
-                        " VALUES (?,?,?)",
-                        (snapshotid, localpath, json.dumps(metadata))
-                        )
-        dirid = self.db.execute("INSERT INTO nodes"
-                                " (snapshotid, parentid, name, isdir, size)"
-                                " VALUES (?,?,?,?,?)",
-                                (snapshotid, parentid, name, 1, size)
-                                ).lastrowid
+        dirid = self.db.execute(
+            "INSERT INTO dirtable"
+            " (snapshotid, parentid, name, metadata_json)"
+            " VALUES (?,?,?,?)",
+            (snapshotid, parentid, name, json.dumps(metadata))
+            ).lastrowid
         cumulative_size = size
         cumulative_items = 1
         for child in os.listdir(abspath):
@@ -170,10 +158,11 @@ class Scanner:
                 cumulative_size += file_size
                 cumulative_items += 1
 
-        self.db.execute("UPDATE nodes"
+        self.db.execute("UPDATE dirtable"
                         " SET cumulative_size=?, cumulative_items=?"
                         " WHERE id=?",
-                        (cumulative_size, cumulative_items, dirid))
+                        (cumulative_size, cumulative_items,
+                         dirid))
         return dirid, cumulative_size, cumulative_items
 
     def process_file(self, snapshotid, localpath, parentid):
@@ -201,21 +190,13 @@ class Scanner:
         # deterministic random function of path+mtime+size.
         fileid = sha256("%s:%s:%s" % (localpath.encode("utf-8"), s.st_mtime, s.st_size)).hexdigest()
         self.db.execute("INSERT INTO filetable"
-                        " (snapshotid, path, metadata_json, size, mtime,fileid)"
-                        " VALUES (?,?,?,?,?,?)",
-                        (snapshotid, localpath, json.dumps(metadata),
-                         s.st_size, s.st_mtime, fileid)
+                        " (snapshotid, parentid, name,"
+                        "  metadata_json, size, mtime, fileid)"
+                        " VALUES (?,?,?, ?,?,?,?)",
+                        (snapshotid, parentid, name,
+                         json.dumps(metadata), s.st_size, s.st_mtime, fileid)
                         )
 
-        fileid = self.db.execute("INSERT INTO nodes "
-                                 "(snapshotid, parentid, name, isdir,"
-                                 " size, cumulative_size, cumulative_items)"
-                                 " VALUES (?,?,?,?,?,?,?)",
-                                 (snapshotid, parentid, name, 0, size, size, 1)
-                                 ).lastrowid
-        filecap = self.upload_file(abspath)
-        self.db.execute("UPDATE nodes SET filecap=? WHERE id=?",
-                        (filecap, fileid))
         return fileid, size
 
     def upload_file(self, abspath):
