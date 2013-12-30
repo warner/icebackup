@@ -1,5 +1,5 @@
 
-import sys, os, hashlib
+import sys, os, hashlib, time
 import dbutil
 from abbreviate import abbreviate_space
 
@@ -9,8 +9,18 @@ CREATE TABLE version -- added in v1
  version INTEGER  -- contains one row, set to 2
 );
 
+CREATE TABLE `snapshots`
+(
+ `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+ `started` INTEGER,
+ `finished` INTEGER,
+ `rootpath` VARCHAR,
+ `root_id` INTEGER
+);
+
 CREATE TABLE `nodes`
 (
+ `snapshotid` INTEGER,
  `isdir` INTEGER, -- 0 or 1
  `id` INTEGER PRIMARY KEY AUTOINCREMENT,
  `parentid` INTEGER, -- or NULL for a root
@@ -23,11 +33,59 @@ CREATE TABLE `nodes`
 
 CREATE INDEX `parentid` ON `nodes` (`parentid`);
 
-CREATE TABLE `roots`
+CREATE TABLE `dirtable`
 (
- `rootpath` VARCHAR,
- `root_id` INTEGER
+ `snapshotid` INTEGER,
+ `path` VARCHAR,
+ `metadata_json` VARCHAR
 );
+
+CREATE TABLE `filetable`
+(
+ `snapshotid` INTEGER,
+ `path` VARCHAR,
+ `metadata_json` VARCHAR
+ `size` INTEGER,
+ `mtime` INTEGER,
+ `fileid` VARCHAR
+);
+
+CREATE INDEX `snapshotid_path` ON `filetable` (`snapshotid`, `path`);
+CREATE INDEX `fileid` ON `filetable` (`fileid`);
+
+CREATE TABLE `captable`
+(
+ `fileid` VARCHAR PRIMARY KEY,
+ `type` INTEGER, -- 0:lit, 1:small, 2:big
+ `filecap` VARCHAR
+);
+
+CREATE INDEX `filecap` ON `captable` (`filecap`);
+
+CREATE TABLE `small_objmap`
+(
+ `filecap` VARCHAR PRIMARY KEY,
+ `storage_index` VARCHAR,
+ `offset` INTEGER,
+ `size` INTEGER,
+ `file_enckey` VARCHAR,
+ `cthash` VARCHAR
+);
+
+CREATE TABLE `big_objmap`
+(
+ `filecap` VARCHAR PRIMARY KEY,
+ `file_enckey` VARCHAR,
+ `cthash` VARCHAR
+);
+
+CREATE TABLE `big_objmap_segments`
+(
+ `filecap` VARCHAR PRIMARY KEY,
+ `segnum` INTEGER,
+ `storage_index` VARCHAR
+);
+
 
 """
 
@@ -39,7 +97,23 @@ class Scanner:
         self.db = dbutil.get_db(dbfile, create_version=(schema, 1),
                                 synchronous="OFF")
 
-    def process_directory(self, localpath, parentid):
+    def scan(self):
+        started = time.time()
+        snapshotid = self.db.execute("INSERT INTO snapshots"
+                                     " (started) VALUES (?)",
+                                     (started,)).lastrowid
+        (rootid, cumulative_size, cumulative_items) = \
+              self.process_directory(snapshotid, u".", None)
+        finished = time.time()
+        self.db.execute("UPDATE snapshots"
+                        " SET finished=?, rootpath=?, root_id=?"
+                        " WHERE id=?",
+                        (finished, self.rootpath, rootid,
+                         snapshotid))
+        self.db.commit()
+        return (cumulative_size, cumulative_items)
+
+    def process_directory(self, snapshotid, localpath, parentid):
         assert isinstance(localpath, unicode)
         # localpath is relative to self.rootpath
         abspath = os.path.join(self.rootpath, localpath)
@@ -48,23 +122,30 @@ class Scanner:
         size = s.st_size # good enough for now
         name = os.path.basename(os.path.abspath(abspath))
         dirid = self.db.execute("INSERT INTO nodes"
-                                " (parentid, name, isdir, size)"
-                                " VALUES (?,?,?,?)", (parentid, name, 1, size)
+                                " (snapshotid, parentid, name, isdir, size)"
+                                " VALUES (?,?,?,?,?)",
+                                (snapshotid, parentid, name, 1, size)
                                 ).lastrowid
         cumulative_size = size
         cumulative_items = 1
         for child in os.listdir(abspath):
             childpath = os.path.join(localpath, child)
 
-            if os.path.isdir(os.path.join(self.rootpath, childpath)):
-                new_dirid, subtree_size, subtree_items = \
-                           self.process_directory(childpath, dirid)
-                cumulative_size += subtree_size
-                cumulative_items += subtree_items
-            elif os.path.islink(os.path.join(self.rootpath, childpath)):
+            if os.path.islink(os.path.join(self.rootpath, childpath)):
                 pass
+            elif os.path.isdir(os.path.join(self.rootpath, childpath)):
+                try:
+                    new_dirid, subtree_size, subtree_items = \
+                               self.process_directory(snapshotid,
+                                                      childpath, dirid)
+                    cumulative_size += subtree_size
+                    cumulative_items += subtree_items
+                except OSError as e:
+                    print e
+                    continue
             else:
-                new_fileid, file_size = self.process_file(childpath, dirid)
+                new_fileid, file_size = self.process_file(snapshotid,
+                                                          childpath, dirid)
                 cumulative_size += file_size
                 cumulative_items += 1
 
@@ -74,7 +155,7 @@ class Scanner:
                         (cumulative_size, cumulative_items, dirid))
         return dirid, cumulative_size, cumulative_items
 
-    def process_file(self, localpath, parentid):
+    def process_file(self, snapshotid, localpath, parentid):
         assert isinstance(localpath, unicode)
         abspath = os.path.join(self.rootpath, localpath)
         name = os.path.basename(os.path.abspath(abspath))
@@ -83,10 +164,10 @@ class Scanner:
         s = os.stat(abspath)
         size = s.st_size
         fileid = self.db.execute("INSERT INTO nodes "
-                                 "(parentid, name, isdir,"
+                                 "(snapshotid, parentid, name, isdir,"
                                  " size, cumulative_size, cumulative_items)"
-                                 " VALUES (?,?,?,?,?,?)",
-                                 (parentid, name, 0, size, size, 1)
+                                 " VALUES (?,?,?,?,?,?,?)",
+                                 (snapshotid, parentid, name, 0, size, size, 1)
                                  ).lastrowid
         filecap = self.upload_file(abspath)
         self.db.execute("UPDATE nodes SET filecap=? WHERE id=?",
@@ -112,14 +193,14 @@ def main():
     root = sys.argv[2].decode("utf-8")
     assert os.path.isdir(root), root
     s = Scanner(root, dbname)
-    rootid, cumulative_size, cumulative_items = s.process_directory(u".", None)
-    s.db.execute("INSERT INTO roots (rootpath, root_id) VALUES (?,?)",
-                 (root, rootid))
-    s.db.commit()
-    print "rootid #%s" % (rootid,)
-    print "cumulative_size %d (%s)" % (cumulative_size,
-                                       abbreviate_space(cumulative_size))
-    print "cumulative_items %d" % cumulative_items
+    command = sys.argv[3]
+    if command == "scan":
+        cumulative_size, cumulative_items = s.scan()
+        print "cumulative_size %d (%s)" % (cumulative_size,
+                                           abbreviate_space(cumulative_size))
+        print "cumulative_items %d" % cumulative_items
+    elif command == "upload":
+        s.upload()
 
 if __name__ == "__main__":
     main()
