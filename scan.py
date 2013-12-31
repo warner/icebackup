@@ -238,8 +238,8 @@ class Scanner:
             elif os.path.isdir(os.path.join(self.rootpath, childpath)):
                 row = self.db.execute(
                     "SELECT * FROM dirtable"
-                    " WHERE parentid=? AND name=?",
-                    (prevnode, os.path.basename(childpath))).fetchone()
+                    " WHERE snapshotid=? AND parentid=? AND name=?",
+                    (self.prev_snapshotid, prevnode, os.path.basename(childpath))).fetchone()
                 try:
                     new_dirid, subtree_size, subtree_items = \
                                self.process_directory(snapshotid,
@@ -253,8 +253,8 @@ class Scanner:
             else:
                 row = self.db.execute(
                     "SELECT * FROM filetable"
-                    " WHERE parentid=? AND name=?",
-                    (prevnode, os.path.basename(childpath))).fetchone()
+                    " WHERE snapshotid=? AND parentid=? AND name=?",
+                    (self.prev_snapshotid, prevnode, os.path.basename(childpath))).fetchone()
                 file_size = self.process_file(snapshotid,
                                               childpath, dirid,
                                               row["id"] if row else None)
@@ -268,7 +268,7 @@ class Scanner:
                          dirid))
         return dirid, cumulative_size, cumulative_items
 
-    def process_file(self, snapshotid, localpath, parentid, prevnode):
+    def process_file(self, snapshotid, localpath, parentid, prevnodeid):
         assert isinstance(localpath, unicode)
         abspath = os.path.join(self.rootpath, localpath)
         name = os.path.basename(os.path.abspath(abspath))
@@ -287,6 +287,11 @@ class Scanner:
         # if the file looks old (the previous snapshot had a file with the
         # same path, size, and mtime), then we're allowed to assume it hasn't
         # changed, and copy the fileid from the last snapshot
+        prevnode = None
+        if prevnodeid:
+            prevnode = self.db.execute(
+                "SELECT * FROM filetable WHERE id=?",
+                (prevnodeid,)).fetchone()
         if (prevnode and
             prevnode["size"] == size and
             prevnode["mtime"] == s.st_mtime):
