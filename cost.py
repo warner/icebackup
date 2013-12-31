@@ -48,8 +48,8 @@ class Bucket:
 buckets = collections.defaultdict(Bucket)
 
 # find the set of directories we're going to care about
-row = c.execute("SELECT * FROM snapshots WHERE finished IS NOT NULL"
-                " ORDER BY finished DESC LIMIT 1").fetchone()
+row = c.execute("SELECT * FROM snapshots WHERE scan_finished IS NOT NULL"
+                " ORDER BY scan_finished DESC LIMIT 1").fetchone()
 snapshotid = row["id"]
 root_id = row["root_id"]
 node = root_id

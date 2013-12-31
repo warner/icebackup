@@ -10,8 +10,8 @@ subpath = []
 if len(sys.argv) > 2:
     subpath = sys.argv[2].split(os.sep)
 
-row = c.execute("SELECT * FROM snapshots WHERE finished IS NOT NULL"
-                " ORDER BY finished DESC LIMIT 1").fetchone()
+row = c.execute("SELECT * FROM snapshots WHERE scan_finished IS NOT NULL"
+                " ORDER BY scan_finished DESC LIMIT 1").fetchone()
 snapshotid = row["id"]
 rootpath = row["rootpath"]
 root_id = row["root_id"]

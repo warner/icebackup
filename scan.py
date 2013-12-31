@@ -14,9 +14,9 @@ CREATE TABLE version -- added in v1
 CREATE TABLE `snapshots`
 (
  `id` INTEGER PRIMARY KEY AUTOINCREMENT,
- `started` INTEGER,
- `finished` INTEGER,
  `rootpath` VARCHAR,
+ `started` INTEGER,
+ `scan_finished` INTEGER,
  `root_id` INTEGER
 );
 
@@ -104,11 +104,11 @@ class Scanner:
                                      (started,)).lastrowid
         (rootid, cumulative_size, cumulative_items) = \
               self.process_directory(snapshotid, u".", None)
-        finished = time.time()
+        scan_finished = time.time()
         self.db.execute("UPDATE snapshots"
-                        " SET finished=?, rootpath=?, root_id=?"
+                        " SET scan_finished=?, rootpath=?, root_id=?"
                         " WHERE id=?",
-                        (finished, self.rootpath, rootid,
+                        (scan_finished, self.rootpath, rootid,
                          snapshotid))
         self.db.commit()
         return (cumulative_size, cumulative_items)
