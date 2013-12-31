@@ -1,6 +1,6 @@
 #!/usr/bin/python
 
-import sys, os, time, base64
+import sys, os, time
 from hashlib import sha256
 import dbutil
 from abbreviate import abbreviate_space
@@ -63,6 +63,28 @@ CREATE TABLE `need_to_upload`
 );
 CREATE INDEX `need_to_upload_fileid` ON `need_to_upload` (`fileid`);
 
+CREATE TABLE `upload_schedule`
+-- one row per stored object (either aggregate, one-file, or segment-of-file)
+(
+ `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+ `storage_index` VARCHAR, -- filled in when we're done
+ `aggregate` INTEGER
+ -- aggregate=0 (not an aggregate), 1 (closed aggregate), 2 (open aggregate)
+);
+CREATE INDEX `upload_schedule_aggregate` ON `upload_schedule` (`aggregate`);
+
+CREATE TABLE `upload_schedule_files`
+(
+ `upload_schedule_id` INTEGER,
+ `filenum` INTEGER,
+ `size` INTEGER, -- size of this part
+ `path` VARCHAR, -- what gets uploaded here
+ `offset` INTEGER -- what part of 'path' gets uploaded
+);
+CREATE UNIQUE INDEX `upload_schedule_files_id` ON `upload_schedule_files` (`upload_schedule_id`, `filenum`);
+
+
+
 CREATE TABLE `captable`
 (
  `fileid` VARCHAR PRIMARY KEY,
@@ -96,10 +118,71 @@ CREATE TABLE `big_objmap_segments`
  `storage_index` VARCHAR
 );
 
-
 """
 
+class Aggregator:
+    """Any row in 'upload_schedule' that has aggregate=2 is available to
+    house aggregate objects. For now, we only keep one of these around. (in
+    the future, we might have multiple ones, to make it easier to keep
+    spatially-related files in the same aggregate).
+    """
+
+    def __init__(self, db, MAXCHUNK):
+        self.db = db
+        self.MAXCHUNK = MAXCHUNK
+        self.upid = None
+
+    def get_upid(self):
+        if not self.upid:
+            row = self.db.execute(
+                "SELECT * FROM upload_schedule"
+                " WHERE aggregate=2"
+                " LIMIT 1"
+                ).fetchone()
+            if row:
+                self.upid = row["id"]
+                self.size = self.db.execute(
+                    "SELECT SUM(size)"
+                    " FROM upload_schedule_files"
+                    " WHERE upload_schedule_id=?",
+                    (self.upid,)).fetchone()[0]
+                row = self.db.execute(
+                    "SELECT MAX(filenum) FROM upload_schedule_files"
+                    " WHERE upload_schedule_id=?",
+                    (self.upid,)).fetchone()
+                # returns (None,) if the table was empty
+                if row[0] is None:
+                    self.next_filenum = 0
+                else:
+                    self.next_filenum = row[0] + 1
+        if not self.upid:
+            self.upid = self.db.execute(
+                "INSERT INTO upload_schedule"
+                " (aggregate) VALUES (2)"
+                ).lastrowid
+            self.size = 0
+            self.next_filenum = 0
+        return self.upid, self.next_filenum
+
+    def add(self, size):
+        self.size += size
+        self.next_filenum += 1
+        if self.size > self.MAXCHUNK:
+            self.close()
+
+    def close(self):
+        if not self.upid:
+            return
+        self.db.execute("UPDATE upload_schedule"
+                        " SET aggregate=1"
+                        " WHERE id=?", (self.upid,))
+        self.upid = None
+
+
 class Scanner:
+    MINCHUNK = 1*1000*1000
+    MAXCHUNK = 100*1000*1000
+
     def __init__(self, rootpath, dbfile):
         assert isinstance(rootpath, unicode)
         self.rootpath = os.path.abspath(rootpath)
@@ -221,14 +304,16 @@ class Scanner:
         return size
 
     def hash_files(self):
+        count = self.db.execute("SELECT COUNT(*) FROM need_to_hash").fetchone()[0]
+        print "need_to_hash: %d" % count
         while True:
             next_batch = list(self.db.execute("SELECT * FROM need_to_hash"
                                               " ORDER BY id ASC"
                                               " LIMIT 200").fetchall())
             if not next_batch:
-                return
+                break
             for row in next_batch:
-                print row["localpath"].encode("utf-8")
+                #print row["localpath"].encode("utf-8")
                 size = self.db.execute("SELECT size FROM filetable WHERE id=?",
                                        (row["filetable_id"],)
                                        ).fetchone()["size"]
@@ -243,7 +328,7 @@ class Scanner:
                                                  " WHERE fileid=?",
                                                  (fileid,)).fetchone()
                 if not uploaded and not need_to_upload:
-                    print " need to upload"
+                    #print " need to upload"
                     path = os.path.join(self.rootpath, row["localpath"])
                     self.db.execute("INSERT INTO need_to_upload"
                                     " (path, fileid, size)"
@@ -254,6 +339,8 @@ class Scanner:
             self.db.execute("DELETE FROM need_to_hash WHERE %s" % where_clause,
                             values)
             self.db.commit()
+        count = self.db.execute("SELECT COUNT(*) FROM need_to_upload").fetchone()[0]
+        print "need_to_upload: %d" % count
 
     def hash_fileid(self, localpath, mtime, size):
         # fileid will be the raw sha256 hash of the file contents. Hashing
@@ -265,6 +352,51 @@ class Scanner:
         # deterministic random function of path+mtime+size.
         fileid = sha256("%s:%s:%s" % (localpath.encode("utf-8"), mtime, size)).hexdigest()
         return fileid
+
+    def schedule_uploads(self):
+        # the actual upload algorithm will batch together small files, and
+        # split large ones. For now, we just pretend.
+        DBX = self.db.execute
+        count = DBX("SELECT COUNT(*) FROM need_to_upload").fetchone()[0]
+        print "need_to_upload: %d" % count
+        # begin transaction
+        agg = Aggregator(self.db, self.MAXCHUNK)
+        for row in DBX("SELECT * FROM need_to_upload ORDER BY id ASC"):
+            size = row["size"]
+            if size < 144: # LIT
+                filecap = "LIT:fake" # todo: base64-encode the contents
+                DBX("INSERT INTO captable (fileid, type, filecap)"
+                    " VALUES (?,?,?)",
+                    (row["fileid"], 0, filecap))
+            elif size < self.MINCHUNK: # small, so aggregate
+                upid, filenum = agg.get_upid()
+                DBX("INSERT INTO upload_schedule_files"
+                    " (upload_schedule_id, filenum, size,"
+                    "  path, offset)"
+                    " VALUES (?,?,?, ?,?)",
+                    (upid, filenum, size,
+                     row["path"], 0))
+                agg.add(size)
+            else: # large, not aggregated
+                # either one segment, or split into multiple segments
+                #print "large file", size
+                for filenum,offset in enumerate(range(0, size, self.MAXCHUNK)):
+                    length = min(size - offset, self.MAXCHUNK)
+                    #print " adding", offset, length, "as filenum", filenum
+                    upid = DBX("INSERT INTO upload_schedule"
+                               " (aggregate) VALUES (0)").lastrowid
+                    DBX("INSERT INTO upload_schedule_files"
+                        " (upload_schedule_id, filenum, size,"
+                        "  path, offset)"
+                        " VALUES (?,?,?, ?,?)",
+                        (upid, filenum, length,
+                         row["path"], offset))
+        agg.close()
+        # end transaction
+        self.db.commit()
+        count = DBX("SELECT COUNT(*) FROM upload_schedule").fetchone()[0]
+        aggregate_count = DBX("SELECT COUNT(*) FROM upload_schedule WHERE aggregate=1").fetchone()[0]
+        print "upload objects: %d (of which %d hold aggregates)" % (count, aggregate_count)
 
     def upload_file(self, abspath):
         return "fake filecap"
@@ -296,6 +428,8 @@ def main():
         print "cumulative_items %d" % cumulative_items
     elif command == "hash_files":
         s.hash_files()
+    elif command == "schedule_uploads":
+        s.schedule_uploads()
     elif command == "upload":
         s.upload()
 
