@@ -1,3 +1,4 @@
+#!/usr/bin/python
 
 import sys, os, time, base64
 from hashlib import sha256

@@ -1,3 +1,4 @@
+#!/usr/bin/python
 
 import os, sys, math, sqlite3
 from abbreviate import abbreviate_space
