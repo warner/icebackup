@@ -1,5 +1,5 @@
 
-import sys, os, time, json, base64
+import sys, os, time, base64
 from hashlib import sha256
 import dbutil
 from abbreviate import abbreviate_space
@@ -25,7 +25,6 @@ CREATE TABLE `dirtable`
  `snapshotid` INTEGER,
  `parentid` INTEGER, -- or NULL for a root
  `name` VARCHAR,
- `metadata_json` VARCHAR,
  `cumulative_size` INTEGER,
  `cumulative_items` INTEGER
 );
@@ -37,7 +36,6 @@ CREATE TABLE `filetable`
  `snapshotid` INTEGER,
  `parentid` INTEGER NOT NULL,
  `name` VARCHAR,
- `metadata_json` VARCHAR,
  `size` INTEGER,
  `mtime` INTEGER,
  `fileid` VARCHAR -- hash of file, or random until we want efficient renames
@@ -122,18 +120,11 @@ class Scanner:
         s = os.stat(abspath)
         size = s.st_size # good enough for now
         name = os.path.basename(os.path.abspath(abspath))
-        metadata = {"st_mode": s.st_mode,
-                    "st_uid": s.st_uid,
-                    "st_gid": s.st_gid,
-                    "st_atime": s.st_atime,
-                    "st_mtime": s.st_mtime,
-                    "st_ctime": s.st_ctime,
-                    }
         dirid = self.db.execute(
             "INSERT INTO dirtable"
-            " (snapshotid, parentid, name, metadata_json)"
+            " (snapshotid, parentid, name)"
             " VALUES (?,?,?,?)",
-            (snapshotid, parentid, name, json.dumps(metadata))
+            (snapshotid, parentid, name)
             ).lastrowid
         cumulative_size = size
         cumulative_items = 1
@@ -173,14 +164,6 @@ class Scanner:
 
         s = os.stat(abspath)
         size = s.st_size
-        metadata = {"st_mode": s.st_mode,
-                    "st_uid": s.st_uid,
-                    "st_gid": s.st_gid,
-                    "st_size": s.st_size,
-                    "st_atime": s.st_atime,
-                    "st_mtime": s.st_mtime,
-                    "st_ctime": s.st_ctime,
-                    }
         # fileid will be the raw sha256 hash of the file contents. Hashing
         # files will let us efficiently handle renames (not re-uploading an
         # unmodified file that just happens to live in a different location
@@ -191,10 +174,10 @@ class Scanner:
         fileid = sha256("%s:%s:%s" % (localpath.encode("utf-8"), s.st_mtime, s.st_size)).hexdigest()
         self.db.execute("INSERT INTO filetable"
                         " (snapshotid, parentid, name,"
-                        "  metadata_json, size, mtime, fileid)"
-                        " VALUES (?,?,?, ?,?,?,?)",
+                        "  size, mtime, fileid)"
+                        " VALUES (?,?,?, ?,?,?)",
                         (snapshotid, parentid, name,
-                         json.dumps(metadata), s.st_size, s.st_mtime, fileid)
+                         s.st_size, s.st_mtime, fileid)
                         )
 
         return fileid, size
