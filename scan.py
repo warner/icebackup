@@ -1,6 +1,6 @@
 #!/usr/bin/python
 
-import sys, os, time
+import sys, os, time, base64
 from hashlib import sha256
 import dbutil
 from abbreviate import abbreviate_space
@@ -393,10 +393,35 @@ class Scanner:
                          row["path"], offset))
         agg.close()
         # end transaction
+        DBX("DELETE FROM need_to_upload")
         self.db.commit()
         count = DBX("SELECT COUNT(*) FROM upload_schedule").fetchone()[0]
         aggregate_count = DBX("SELECT COUNT(*) FROM upload_schedule WHERE aggregate=1").fetchone()[0]
         print "upload objects: %d (of which %d hold aggregates)" % (count, aggregate_count)
+
+    def upload(self):
+        DBX = self.db.execute
+        count = DBX("SELECT COUNT(*) FROM upload_schedule").fetchone()[0]
+        print "uploads scheduled: %d" % count
+        while True:
+            next_batch = list(DBX("SELECT * FROM upload_schedule"
+                                  " ORDER BY id ASC"
+                                  " LIMIT 20").fetchall())
+            if not next_batch:
+                break
+            for row in next_batch:
+                # fake it
+                upid = row["id"]
+                size = DBX("SELECT SUM(size) FROM upload_schedule_files"
+                           " WHERE upload_schedule_id=?", (upid,)
+                           ).fetchone()[0]
+                print "fake-uploading %d bytes" % size
+                storage_index = base64.b64encode(os.urandom(32))
+                # TODO: store it somewhere, update some stuff
+                DBX("DELETE FROM upload_schedule WHERE id=?", (upid,))
+                DBX("DELETE FROM upload_schedule_files WHERE upload_schedule_id=?", (upid,))
+        self.db.commit()
+        print "done"
 
     def upload_file(self, abspath):
         return "fake filecap"
@@ -410,9 +435,6 @@ class Scanner:
         f.close()
         filecap = "file:%s" % h.hexdigest()
         return filecap
-
-    def upload(self):
-        pass
 
 def main():
     dbname = sys.argv[1]
