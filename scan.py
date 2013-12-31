@@ -99,6 +99,12 @@ class Scanner:
 
     def scan(self):
         started = time.time()
+        row = self.db.execute("SELECT id FROM snapshots"
+                              " WHERE scan_finished IS NOT NULL"
+                              " ORDER BY id DESC LIMIT 1").fetchone()
+        prev_snapshotid = None
+        if row:
+            prev_snapshotid = row["id"]
         snapshotid = self.db.execute("INSERT INTO snapshots"
                                      " (started) VALUES (?)",
                                      (started,)).lastrowid
@@ -124,7 +130,7 @@ class Scanner:
         dirid = self.db.execute(
             "INSERT INTO dirtable"
             " (snapshotid, parentid, name)"
-            " VALUES (?,?,?,?)",
+            " VALUES (?,?,?)",
             (snapshotid, parentid, name)
             ).lastrowid
         cumulative_size = size
