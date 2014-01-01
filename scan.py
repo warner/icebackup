@@ -459,6 +459,8 @@ def main():
         s.schedule_uploads()
     elif command == "upload":
         s.upload()
+    else:
+        print "unknown command", command
 
 if __name__ == "__main__":
     main()
