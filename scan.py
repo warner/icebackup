@@ -5,19 +5,33 @@ from hashlib import sha256
 import dbutil
 from abbreviate import abbreviate_space
 
+# glossary:
+#  snapshotid: DB id of a given snapshot
+#  snapshot: contains data about all children of a rootpath
+#  rootpath: e.g. ~ or /Backups/2014-04-15.HHMM
+#  localpath: relative to rootpath, e.g. stuff/tahoe/icebackup/setup.py
+#  fileid: sha256 of file. Used to spot renames. filecap=captable[fileid]
+#  filecap: ?
+
+NON_AGGREGATE, CLOSED_AGGREGATE, OPEN_AGGREGATE = (0,1,2)
+LITERAL, SMALL, LARGE = (0,1,2)
+# a LITERAL file lives in the filecap itself
+# one or more SMALL files live in a single storage object
+# a LARGE file is segmented into multiple storage objects
+
 schema = """
 CREATE TABLE version -- added in v1
 (
- version INTEGER  -- contains one row, set to 2
+ version INTEGER  -- contains one row, set to 1
 );
 
 CREATE TABLE `snapshots`
 (
  `id` INTEGER PRIMARY KEY AUTOINCREMENT,
  `rootpath` VARCHAR,
- `started` INTEGER,
- `scan_finished` INTEGER,
- `root_id` INTEGER
+ `started` INTEGER, -- timestamp
+ `scan_finished` INTEGER, -- timestamp
+ `root_id` INTEGER -- dirtable.id
 );
 
 CREATE TABLE `dirtable`
@@ -26,8 +40,8 @@ CREATE TABLE `dirtable`
  `snapshotid` INTEGER,
  `parentid` INTEGER, -- or NULL for a root
  `name` VARCHAR,
- `cumulative_size` INTEGER,
- `cumulative_items` INTEGER
+ `cumulative_size` INTEGER, -- includes space for the dirnode itself
+ `cumulative_items` INTEGER -- includes 1 for the direnode itself
 );
 CREATE INDEX `dirtable_snapshotid_parentid_name` ON `dirtable`
  (`snapshotid`, `parentid`, `name`);
@@ -57,8 +71,8 @@ CREATE TABLE `need_to_hash`
 CREATE TABLE `need_to_upload`
 (
  `id` INTEGER PRIMARY KEY AUTOINCREMENT,
- `path` VARCHAR,
- `fileid` VARCHAR UNIQUE,
+ `path` VARCHAR, -- absolute path, not localpath
+ `fileid` VARCHAR UNIQUE, -- set captable[fileid]=filecap when uploaded
  `size` INTEGER
 );
 CREATE INDEX `need_to_upload_fileid` ON `need_to_upload` (`fileid`);
@@ -69,7 +83,7 @@ CREATE TABLE `upload_schedule`
  `id` INTEGER PRIMARY KEY AUTOINCREMENT,
  `storage_index` VARCHAR, -- filled in when we're done
  `aggregate` INTEGER
- -- aggregate=0 (not an aggregate), 1 (closed aggregate), 2 (open aggregate)
+ -- aggregate=0 (NON_AGGREGATE), 1 (CLOSED_AGGREGATE), 2 (OPEN_AGGREGATE)
 );
 CREATE INDEX `upload_schedule_aggregate` ON `upload_schedule` (`aggregate`);
 
@@ -121,7 +135,10 @@ CREATE TABLE `big_objmap_segments`
 """
 
 class Aggregator:
-    """Any row in 'upload_schedule' that has aggregate=2 is available to
+    """I keep track of which scheduled-upload-object is available to hold
+    aggregates of small files.
+
+    Any row in 'upload_schedule' that has aggregate=2 is available to
     house aggregate objects. For now, we only keep one of these around. (in
     the future, we might have multiple ones, to make it easier to keep
     spatially-related files in the same aggregate).
@@ -133,11 +150,11 @@ class Aggregator:
         self.upid = None
 
     def get_upid(self):
-        if not self.upid:
+        if self.upid is None:
             row = self.db.execute(
                 "SELECT * FROM upload_schedule"
-                " WHERE aggregate=2"
-                " LIMIT 1"
+                " WHERE aggregate=?"
+                " LIMIT 1", (OPEN_AGGREGATE,)
                 ).fetchone()
             if row:
                 self.upid = row["id"]
@@ -155,10 +172,10 @@ class Aggregator:
                     self.next_filenum = 0
                 else:
                     self.next_filenum = row[0] + 1
-        if not self.upid:
+        if self.upid is None:
             self.upid = self.db.execute(
                 "INSERT INTO upload_schedule"
-                " (aggregate) VALUES (2)"
+                " (aggregate) VALUES (?)", (OPEN_AGGREGATE,)
                 ).lastrowid
             self.size = 0
             self.next_filenum = 0
@@ -174,8 +191,8 @@ class Aggregator:
         if not self.upid:
             return
         self.db.execute("UPDATE upload_schedule"
-                        " SET aggregate=1"
-                        " WHERE id=?", (self.upid,))
+                        " SET aggregate=?"
+                        " WHERE id=?", (CLOSED_AGGREGATE, self.upid,))
         self.upid = None
 
 
@@ -192,7 +209,7 @@ class Scanner:
         self.prev_snapshotid, self.prev_rootid = None, None
         row = self.db.execute("SELECT * FROM snapshots"
                               " WHERE scan_finished IS NOT NULL"
-                              " ORDER BY id DESC LIMIT 1").fetchone()
+                              " ORDER BY scan_finished DESC LIMIT 1").fetchone()
         if row:
             self.prev_snapshotid = row["id"]
             self.prev_rootid = row["root_id"]
@@ -232,34 +249,39 @@ class Scanner:
         cumulative_items = 1
         for child in os.listdir(abspath):
             childpath = os.path.join(localpath, child)
+            abschildpath = os.path.join(self.rootpath, childpath)
 
-            if os.path.islink(os.path.join(self.rootpath, childpath)):
-                pass
-            elif os.path.isdir(os.path.join(self.rootpath, childpath)):
+            if os.path.isdir(abschildpath):
                 row = self.db.execute(
                     "SELECT * FROM dirtable"
                     " WHERE snapshotid=? AND parentid=? AND name=?",
-                    (self.prev_snapshotid, prevnode, os.path.basename(childpath))).fetchone()
+                    (self.prev_snapshotid, prevnode, child)).fetchone()
+                prevchildnode = row["id"] if row else None
                 try:
                     new_dirid, subtree_size, subtree_items = \
                                self.process_directory(snapshotid,
                                                       childpath, dirid,
-                                                      row["id"] if row else None)
+                                                      prevchildnode)
                     cumulative_size += subtree_size
                     cumulative_items += subtree_items
                 except OSError as e:
                     print e
                     continue
-            else:
+            elif os.path.isfile(abschildpath):
                 row = self.db.execute(
                     "SELECT * FROM filetable"
                     " WHERE snapshotid=? AND parentid=? AND name=?",
-                    (self.prev_snapshotid, prevnode, os.path.basename(childpath))).fetchone()
+                    (self.prev_snapshotid, prevnode, child)).fetchone()
+                prevchildnode = row["id"] if row else None
                 file_size = self.process_file(snapshotid,
                                               childpath, dirid,
-                                              row["id"] if row else None)
+                                              prevchildnode)
                 cumulative_size += file_size
                 cumulative_items += 1
+            elif os.path.islink(abschildpath):
+                pass
+            else:
+                print "ignoring non-file/dir/link %s" % abschildpath
 
         self.db.execute("UPDATE dirtable"
                         " SET cumulative_size=?, cumulative_items=?"
@@ -308,6 +330,15 @@ class Scanner:
 
         return size
 
+    # after scan() (process_directory/process_file) completes, the
+    # 'snapshots' row will be done (scan_finished!=NULL), and the dirtable
+    # will be complete (all data in all rows will be present). The filetable
+    # will contain all rows, however:
+    #
+    #  * some rows will not have a fileid. These rows should each have a
+    #    matching entry in 'need_to_hash'. Each represents a new file or a
+    #    file which does not match the size/mtime of the previous scan.
+
     def hash_files(self):
         count = self.db.execute("SELECT COUNT(*) FROM need_to_hash").fetchone()[0]
         print "need_to_hash: %d" % count
@@ -319,26 +350,7 @@ class Scanner:
                 break
             for row in next_batch:
                 #print row["localpath"].encode("utf-8")
-                size = self.db.execute("SELECT size FROM filetable WHERE id=?",
-                                       (row["filetable_id"],)
-                                       ).fetchone()["size"]
-                fileid = self.hash_fileid(row["localpath"], row["mtime"], size)
-                self.db.execute("UPDATE filetable SET fileid=? WHERE id=?",
-                                (row["filetable_id"], fileid))
-                uploaded = self.db.execute("SELECT * FROM captable"
-                                           " WHERE fileid=?",
-                                           (fileid,)
-                                           ).fetchone()
-                need_to_upload = self.db.execute("SELECT * FROM need_to_upload"
-                                                 " WHERE fileid=?",
-                                                 (fileid,)).fetchone()
-                if not uploaded and not need_to_upload:
-                    #print " need to upload"
-                    path = os.path.join(self.rootpath, row["localpath"])
-                    self.db.execute("INSERT INTO need_to_upload"
-                                    " (path, fileid, size)"
-                                    " VALUES (?,?,?)",
-                                    (path, fileid, size))
+                self.hash_file(row)
             where_clause = " OR ".join(["id=?" for row in next_batch])
             values = tuple([row["id"] for row in next_batch])
             self.db.execute("DELETE FROM need_to_hash WHERE %s" % where_clause,
@@ -346,6 +358,35 @@ class Scanner:
             self.db.commit()
         count = self.db.execute("SELECT COUNT(*) FROM need_to_upload").fetchone()[0]
         print "need_to_upload: %d" % count
+
+    def hash_file(self, row):
+        size = self.db.execute("SELECT size FROM filetable WHERE id=?",
+                               (row["filetable_id"],)
+                               ).fetchone()["size"]
+        fileid = self.hash_fileid(row["localpath"], row["mtime"], size)
+        self.db.execute("UPDATE filetable SET fileid=? WHERE id=?",
+                        (row["filetable_id"], fileid))
+
+        uploaded = self.db.execute("SELECT * FROM captable"
+                                   " WHERE fileid=?",
+                                   (fileid,)
+                                   ).fetchone()
+        if uploaded:
+            return
+
+        already_marked = self.db.execute("SELECT *"
+                                         " FROM need_to_upload"
+                                         " WHERE fileid=?",
+                                         (fileid,)).fetchone()
+        if already_marked:
+            return
+
+        #print " need to upload"
+        path = os.path.join(self.rootpath, row["localpath"])
+        self.db.execute("INSERT INTO need_to_upload"
+                        " (path, fileid, size)"
+                        " VALUES (?,?,?)",
+                        (path, fileid, size))
 
     def hash_fileid(self, localpath, mtime, size):
         # fileid will be the raw sha256 hash of the file contents. Hashing
@@ -357,6 +398,10 @@ class Scanner:
         # deterministic random function of path+mtime+size.
         fileid = sha256("%s:%s:%s" % (localpath.encode("utf-8"), mtime, size)).hexdigest()
         return fileid
+
+    # after hash_files(), all filetable rows should have a fileid. However,
+    # some of these fileids will not be present in 'captable'. These files
+    # need to be uploaded, and will match entries in 'need_to_upload'.
 
     def schedule_uploads(self):
         # the actual upload algorithm will batch together small files, and
@@ -372,8 +417,10 @@ class Scanner:
                 filecap = "LIT:fake" # todo: base64-encode the contents
                 DBX("INSERT INTO captable (fileid, type, filecap)"
                     " VALUES (?,?,?)",
-                    (row["fileid"], 0, filecap))
+                    (row["fileid"], LITERAL, filecap))
             elif size < self.MINCHUNK: # small, so aggregate
+                # the Aggregator adds rows to 'upload_schedule', but we add
+                # rows to 'upload_schedule_files' here
                 upid, filenum = agg.get_upid()
                 DBX("INSERT INTO upload_schedule_files"
                     " (upload_schedule_id, filenum, size,"
@@ -389,7 +436,8 @@ class Scanner:
                     length = min(size - offset, self.MAXCHUNK)
                     #print " adding", offset, length, "as filenum", filenum
                     upid = DBX("INSERT INTO upload_schedule"
-                               " (aggregate) VALUES (0)").lastrowid
+                               " (aggregate) VALUES (?)", (NON_AGGREGATE,)
+                               ).lastrowid
                     DBX("INSERT INTO upload_schedule_files"
                         " (upload_schedule_id, filenum, size,"
                         "  path, offset)"
@@ -401,10 +449,19 @@ class Scanner:
         DBX("DELETE FROM need_to_upload")
         self.db.commit()
         count = DBX("SELECT COUNT(*) FROM upload_schedule").fetchone()[0]
-        aggregate_count = DBX("SELECT COUNT(*) FROM upload_schedule WHERE aggregate=1").fetchone()[0]
-        print "upload objects: %d (of which %d hold aggregates)" % (count, aggregate_count)
+        aggregate_count = DBX("SELECT COUNT(*) FROM upload_schedule"
+                              " WHERE aggregate=?",
+                              (CLOSED_AGGREGATE,)).fetchone()[0]
+        print "upload objects: %d (of which %d hold aggregates)" \
+              % (count, aggregate_count)
 
-    def upload(self):
+    # after schedule_uploads(), 'need_to_upload' will be empty, and
+    # 'upload_schedule'/'upload_schedule'files' will be populated with the
+    # mappings from local files to storage objects (many-to-one for small
+    # files that get aggregated together, one-to-one for medium-sized files,
+    # and one-to-many for large files that must be segmented before upload).
+
+    def upload_files(self):
         DBX = self.db.execute
         count = DBX("SELECT COUNT(*) FROM upload_schedule").fetchone()[0]
         print "uploads scheduled: %d" % count
@@ -441,6 +498,9 @@ class Scanner:
         filecap = "file:%s" % h.hexdigest()
         return filecap
 
+    # after upload_files(), 'upload_schedule' will be empty, and all fileids
+    # in 'filetable' should have filecaps in 'captable'.
+
 def main():
     dbname = sys.argv[1]
     assert dbname.endswith(".sqlite"), dbname
@@ -458,7 +518,7 @@ def main():
     elif command == "schedule_uploads":
         s.schedule_uploads()
     elif command == "upload":
-        s.upload()
+        s.upload_files()
     else:
         print "unknown command", command
 
