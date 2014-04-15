@@ -474,16 +474,26 @@ class Scanner:
             for row in next_batch:
                 # fake it
                 upid = row["id"]
-                size = DBX("SELECT SUM(size) FROM upload_schedule_files"
-                           " WHERE upload_schedule_id=?", (upid,)
-                           ).fetchone()[0]
-                print "fake-uploading %d bytes" % size
-                storage_index = base64.b64encode(os.urandom(32))
+                objectpath, size = self.prepare_upload(upid)
+                objectcap = self.upload_object(objectpath, size)
                 # TODO: store it somewhere, update some stuff
                 DBX("DELETE FROM upload_schedule WHERE id=?", (upid,))
                 DBX("DELETE FROM upload_schedule_files WHERE upload_schedule_id=?", (upid,))
         self.db.commit()
         print "done"
+
+    def prepare_upload(self, upid):
+        DBX = self.db.execute
+        size = DBX("SELECT SUM(size) FROM upload_schedule_files"
+                   " WHERE upload_schedule_id=?", (upid,)
+                   ).fetchone()[0]
+        return "path", size
+
+    def upload_object(self, objectpath, size):
+        print "fake-uploading %d bytes" % size
+        storage_index = base64.b64encode(os.urandom(32))
+        objectcap = "fake:"+storage_index
+        return objectcap
 
     def upload_file(self, abspath):
         return "fake filecap"
